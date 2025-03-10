@@ -289,6 +289,204 @@ def testModel(model, x, c, *, batchSize=None, filePathLst=None, doMC=False, outM
                 return q, evap, Parameters_R2P
         else:
             return yOut
+        
+def train2Model(model,
+                loaded_hbv,
+               x,
+                x2,
+               y,
+               c,
+                c2,
+               lossFun,
+               *,
+                c_hydro=None,
+               nEpoch=500,
+               miniBatch=[100, 30],
+               saveEpoch=100,
+               saveFolder=None,
+               mode='seq2seq',
+               bufftime=0,
+               prcp_loss_factor = 15,
+               smooth_loss_factor = 0,
+               multiforcing=False):
+    batchSize, rho = miniBatch
+    # x- input; z - additional input; y - target; c - constant input
+    if type(x) is tuple or type(x) is list:
+        x, z = x
+        x2, z2 = x2
+    ngrid, nt, nx = x.shape
+    ngrid, nt, nx2 = x2.shape
+    if c is not None:
+        nx = nx + c.shape[-1]
+        nx2 = nx2 + c2.shape[-1]
+    if batchSize >= ngrid:
+        # batchsize larger than total grids
+        batchSize = ngrid
+
+    nIterEp = int(
+        np.ceil(np.log(0.01) / np.log(1 - batchSize * rho / ngrid / (nt-bufftime))))
+    if hasattr(model, 'ctRm'):
+        if model.ctRm is True:
+            nIterEp = int(
+                np.ceil(
+                    np.log(0.01) / np.log(1 - batchSize *
+                                          (rho - model.ct) / ngrid / (nt-bufftime))))
+
+    if torch.cuda.is_available():
+        lossFun = lossFun.cuda()
+        model = model.cuda()
+        loaded_hbv = loaded_hbv.cuda()
+
+    # optim = torch.optim.Adadelta(list(model.parameters()) + list(loaded_hbv.parameters()))
+    optim = torch.optim.Adadelta(list(model.parameters()))
+    # loaded_hbv.zero_grad()
+    model.zero_grad()
+    if saveFolder is not None:
+        runFile = os.path.join(saveFolder, 'run.csv')
+        rf = open(runFile, 'w+')
+    for iEpoch in range(1, nEpoch + 1):
+        lossEp = 0
+        if multiforcing is True:
+            loss_prcp_Ep = 0
+            # loss_pet_Ep = 0
+            # loss_temp_Ep = 0
+            loss_sf_Ep = 0
+            loss_smooth_Ep = 0
+        t0 = time.time()
+        for iIter in range(0, nIterEp):
+            # training iterations
+            if type(model) in [rnn.LstmCloseModel, rnn.AnnCloseModel, rnn.CNN1dLSTMmodel, rnn.CNN1dLSTMInmodel,
+                               rnn.CNN1dLCmodel, rnn.CNN1dLCInmodel, rnn.CudnnInvLstmModel,
+                               rnn.MultiInv_HBVModel, rnn.MultiInv_HBVTDModel, rnn.prcp_weights, rnn.forc_weights,
+                               rnn.prcp_weights_only]:
+                iGrid, iT = randomIndex(ngrid, nt, [batchSize, rho], bufftime=bufftime)
+                if type(model) in [rnn.MultiInv_HBVModel, rnn.MultiInv_HBVTDModel, rnn.prcp_weights, rnn.forc_weights,
+                                   rnn.prcp_weights_only]:
+                    xTrain = selectSubset(x, iGrid, iT, rho, bufftime=bufftime)
+                    # xTrain_hbv = selectSubset(x2, iGrid, iT, rho, bufftime=bufftime)
+                else:
+                    xTrain = selectSubset(x, iGrid, iT, rho, c=c)
+                    # xTrain_hbv = selectSubset(x2, iGrid, iT, rho, c=c2)
+                yTrain = selectSubset(y, iGrid, iT, rho)
+                if type(model) in [rnn.CNN1dLCmodel, rnn.CNN1dLCInmodel]:
+                    zTrain = selectSubset(z, iGrid, iT=None, rho=None, LCopt=True)
+                    zTrain_hbv = selectSubset(z2, iGrid, iT=None, rho=None, LCopt=True)
+                elif type(model) in [rnn.CudnnInvLstmModel]: # For smap inv LSTM, HBV Inv
+                    # zTrain = selectSubset(z, iGrid, iT=None, rho=None, LCopt=False)
+                    zTrain = selectSubset(z, iGrid, iT=None, rho=None, LCopt=False, c=c) # Add the attributes to inv
+                    zTrain_hbv = selectSubset(z2, iGrid, iT=None, rho=None, LCopt=False, c=c2) # Add the attributes to inv
+                elif type(model) in [rnn.MultiInv_HBVModel]:
+                    zTrain = selectSubset(z, iGrid, iT, rho, c=c)
+                    zTrain_hbv = selectSubset(z2, iGrid, iT, rho, c=c2)
+                elif type(model) in [rnn.MultiInv_HBVTDModel, rnn.prcp_weights, rnn.prcp_weights_only, rnn.forc_weights]:
+                    zTrain = selectSubset(z, iGrid, iT, rho, c=c, bufftime=bufftime)
+                    zTrain_hbv = selectSubset(z2, iGrid, iT, rho, c=c2, bufftime=bufftime)
+                else:
+                    zTrain = selectSubset(z, iGrid, iT, rho)
+                    zTrain_hbv = selectSubset(z2, iGrid, iT, rho)
+                # loaded_hbv.train(mode=False)
+                c2_hbv = torch.from_numpy(c2[iGrid,:]).float().cuda()
+                xP, prcp_loss, smooth_loss,  prcp_wghts, hbvrout = model(xTrain, zTrain, c2_hbv, prcp_loss_factor, smooth_loss_factor)
+                if type(loaded_hbv) in [rnn.SACSMA, rnn.PRMS]:
+                    yP = loaded_hbv(x_hydro_model = xP, z = zTrain_hbv, c_hydro_model = c_hydro[iGrid], rout = hbvrout)
+                elif type(loaded_hbv) in [rnn.CudnnLstmModel]:
+                    zTrain_hbv[:, :, 1] = xP[:,:,0]
+                    yP = loaded_hbv(zTrain_hbv)[bufftime:, :, :]
+                else:
+                    yP = loaded_hbv(xP, zTrain_hbv, hbvrout)
+                # yP = model(xTrain, zTrain, prcp_loss_factor, smooth_loss_factor, multiforcing)
+                # yP = model(xTrain, zTrain)
+            if type(model) in [cnn.LstmCnn1d]:
+                iGrid, iT = randomIndex(ngrid, nt, [batchSize, rho])
+                xTrain = selectSubset(x, iGrid, iT, rho, c=c)
+                # xTrain = rho/time * Batchsize * Ninput_var
+                xTrain = xTrain.permute(1, 2, 0)
+                yTrain = selectSubset(y, iGrid, iT, rho)
+                # yTrain = rho/time * Batchsize * Ntraget_var
+                yTrain = yTrain.permute(1, 2, 0)[:, :, int(rho/2):]
+                yP = model(xTrain)
+            # if type(model) in [hydroDL.model.rnn.LstmCnnCond]:
+            #     iGrid, iT = randomIndex(ngrid, nt, [batchSize, rho])
+            #     xTrain = selectSubset(x, iGrid, iT, rho)
+            #     yTrain = selectSubset(y, iGrid, iT, rho)
+            #     zTrain = selectSubset(z, iGrid, None, None)
+            #     yP = model(xTrain, zTrain)
+            # if type(model) in [hydroDL.model.rnn.LstmCnnForcast]:
+            #     iGrid, iT = randomIndex(ngrid, nt, [batchSize, rho])
+            #     xTrain = selectSubset(x, iGrid, iT, rho)
+            #     yTrain = selectSubset(y, iGrid, iT + model.ct, rho - model.ct)
+            #     zTrain = selectSubset(z, iGrid, iT, rho)
+            #     yP = model(xTrain, zTrain)
+            else:
+                Exception('unknown model')
+            # # consider the buff time for initialization
+            # if bufftime > 0:
+            #     yP = yP[bufftime:,:,:]
+            ## temporary test for NSE loss
+            if type(lossFun) in [crit.NSELossBatch, crit.NSESqrtLossBatch]:
+                # if multiforcing==True:
+                loss_sf = lossFun(yP, yTrain, iGrid)
+                loss =  loss_sf + prcp_loss + smooth_loss
+                # else:
+                #     loss = lossFun(yP, yTrain, iGrid)
+            else:
+                # if multiforcing==True:
+                loss_sf = lossFun(yP, yTrain)
+                loss = loss_sf + prcp_loss + smooth_loss
+                # else:
+                #     loss = lossFun(yP, yTrain)
+            loss.backward()
+            optim.step()
+            # model.zero_grad()
+            optim.zero_grad()
+            lossEp = lossEp + loss.item()
+            try:
+                loss_prcp_Ep = loss_prcp_Ep + prcp_loss.item()
+                loss_smooth_Ep = loss_smooth_Ep + smooth_loss.item()
+            except:
+                pass
+            # loss_pet_Ep = loss_pet_Ep + pet_loss.item()
+            # loss_temp_Ep = loss_temp_Ep + temp_loss.item()
+            # loss_temp_Ep = 0
+            # loss_pet_Ep = 0
+            loss_sf_Ep = loss_sf_Ep + loss_sf.item()
+                # loss_smooth_Ep = loss_smooth_Ep + smooth_loss.item()
+            # print(iIter, '  ', loss.item())
+            # if iIter == 223:
+            #     print('This is the error point')
+            #     print('Debug start')
+
+            if iIter % 100 == 0:
+                print('Iter {} of {}: Loss {:.3f}'.format(iIter, nIterEp, loss.item()))
+        # print loss
+        lossEp = lossEp / nIterEp
+        # if multiforcing==True:
+        loss_sf_Ep = loss_sf_Ep / nIterEp
+        loss_prcp_Ep = loss_prcp_Ep / nIterEp
+        loss_smooth_Ep = loss_smooth_Ep / nIterEp
+        # loss_pet_Ep = loss_pet_Ep / nIterEp
+        # loss_temp_Ep = loss_temp_Ep / nIterEp
+        logStr = 'Epoch {} Loss {:.3f}, Streamflow Loss {:.3f}, Precipitation Loss {:.3f}, Variance Loss {:.3f}, time {:.2f}'.format(
+            iEpoch, lossEp, loss_sf_Ep, loss_prcp_Ep, loss_smooth_Ep,
+            time.time() - t0)
+        # else:
+        #     logStr = 'Epoch {} Loss {:.3f}, time {:.2f}'.format(
+        #         iEpoch, lossEp, time.time() - t0)
+        print(logStr)
+        # save model and loss
+        if saveFolder is not None:
+            rf.write(logStr + '\n')
+            if iEpoch % saveEpoch == 0:
+                # save model
+                modelFile = os.path.join(saveFolder,
+                                         'model_Ep' + str(iEpoch) + '.pt')
+                torch.save(model, modelFile)
+                # modelFile_hbv = os.path.join(saveFolder,
+                #                          'model_hbv_Ep' + str(iEpoch) + '.pt')
+                # torch.save(loaded_hbv, modelFile_hbv)
+    if saveFolder is not None:
+        rf.close()
+    return model
 
 def testModelCnnCond(model, x, y, *, batchSize=None):
     ngrid, nt, nx = x.shape
@@ -323,6 +521,164 @@ def testModelCnnCond(model, x, y, *, batchSize=None):
         yP[:, iS[i]:iE[i], :] = model(xTemp, cTemp)
     yOut = yP.detach().cpu().numpy().swapaxes(0, 1)
     return yOut
+
+def test2Model(model, loaded_hbv, x1, x2, c, *, c_hydro = None, batchSize=None, filePathLst=None, doMC=False, outModel=None, savePath=None, prcp_loss_factor=15, multiforcing=False, smooth_loss_factor=0, prcp_datatypes=1):
+# def testModel(model, x, c, *, batchSize=None, filePathLst=None, doMC=False, outModel=None, savePath=None, prcp_loss_factor=15, multiforcing=False, smooth_loss_factor=1):
+    # outModel, savePath: only for R2P-hymod model, for other models always set None
+    if type(x2) is tuple or type(x2) is list:
+        x2, z2 = x2
+        x1, z1 = x1
+    else:
+        z2 = None
+        z1 = None
+    ngrid, nt, nx = x1.shape
+    if c is not None:
+        nc = c.shape[-1]
+    if type(loaded_hbv) in [rnn.SACSMA, rnn.PRMS, rnn.CudnnLstmModel]:
+        ny=1
+    elif type(model) in [rnn.MultiInv_HBVModel, rnn.MultiInv_HBVTDModel, rnn.MultiInv_HBVTDModel_1,
+                         rnn.prcp_weights, rnn.forc_weights]:
+        ny=6 # streamflow
+    else:
+        ny = model.ny
+    if batchSize is None:
+        batchSize = ngrid
+    if torch.cuda.is_available():
+        model = model.cuda()
+        loaded_hbv = loaded_hbv.cuda()
+
+    model.train(mode=False)
+    loaded_hbv.train(mode=False)
+    if hasattr(model, 'ctRm'):
+        if model.ctRm is True:
+            nt = nt - model.ct
+    # yP = torch.zeros([nt, ngrid, ny])
+    iS = np.arange(0, ngrid, batchSize)
+    iE = np.append(iS[1:], ngrid)
+
+    # deal with file name to save
+    if filePathLst is None:
+        filePathLst = ['out' + str(x) for x in range(ny)]
+    fLst = list()
+    for filePath in filePathLst:
+        if os.path.exists(filePath):
+            os.remove(filePath)
+        f = open(filePath, 'a')
+        fLst.append(f)
+
+    # forward for each batch
+    for i in range(0, len(iS)):
+        print('batch {}'.format(i))
+        xTemp1 = x1[iS[i]:iE[i], :, :]
+        xTemp2 = x2[iS[i]:iE[i], :, :]
+        # if c is not None:
+        #     cTemp = np.repeat(
+        #         np.reshape(c[iS[i]:iE[i], :], [iE[i] - iS[i], 1, nc]), nt, axis=1)
+        #     xTest1 = torch.from_numpy(
+        #         np.swapaxes(np.concatenate([xTemp1, cTemp], 2), 1, 0)).float()
+        #     xTest2 = torch.from_numpy(
+        #         np.swapaxes(np.concatenate([xTemp2, cTemp], 2), 1, 0)).float()
+        # else:
+        xTest1 = torch.from_numpy(
+            np.swapaxes(xTemp1, 1, 0)).float()
+        xTest2 = torch.from_numpy(
+            np.swapaxes(xTemp2, 1, 0)).float()
+        if torch.cuda.is_available():
+            xTest1 = xTest1.cuda()
+            xTest2 = xTest2.cuda()
+        if z1 is not None:
+
+            zTemp1 = z1[iS[i]:iE[i], :, :]
+            zTemp2 = z2[iS[i]:iE[i], :, :]
+
+            zTest1 = torch.from_numpy(np.swapaxes(zTemp1, 1, 0)).float()
+            zTest2 = torch.from_numpy(np.swapaxes(zTemp2, 1, 0)).float()
+            if torch.cuda.is_available():
+                zTest1 = zTest1.cuda()
+                zTest2 = zTest2.cuda()
+
+        if type(model) in [rnn.LstmCloseModel, rnn.AnnCloseModel, rnn.CNN1dLSTMmodel, rnn.CNN1dLSTMInmodel,
+                           rnn.CNN1dLCmodel, rnn.CNN1dLCInmodel, rnn.CudnnInvLstmModel,
+                           rnn.MultiInv_HBVModel, rnn.MultiInv_HBVTDModel, rnn.MultiInv_HBVTDModel_1, rnn.prcp_weights,
+                           rnn.forc_weights, rnn.SACSMA, rnn.PRMS, rnn.prcp_weights_only]:
+            c2_hbv = torch.from_numpy(c[iS[i]:iE[i], :]).float().cuda()
+            xP, prcp_loss, smooth_loss, prcp_pet_wghts, hbvrout = model(xTest1, zTest1, c2_hbv, prcp_loss_factor, smooth_loss_factor)
+
+            if type(loaded_hbv) in [rnn.SACSMA, rnn.PRMS]:
+                c_hydro_model = torch.from_numpy(c_hydro[iS[i]:iE[i], :]).float().cuda()
+                yP = loaded_hbv(x_hydro_model=xP, z=zTest2, c_hydro_model=c_hydro_model, rout = hbvrout)
+            elif type(loaded_hbv) in [rnn.CudnnLstmModel]:
+                zTest2[:, :, 1] = xP[:, :, 0]
+                yP = loaded_hbv(zTest2)
+            else:
+                yP = loaded_hbv(xP, zTest2, hbvrout)
+
+
+
+
+        # if i == 0:
+        #     grad_ar_daymet = grad_daymet.detach().cpu().numpy()
+        #     grad_ar_maurer = grad_maurer.detach().cpu().numpy()
+        #     grad_ar_nldas = grad_nldas.detach().cpu().numpy()
+        # else:
+        #     grad_daymet_tmp = grad_daymet.detach().cpu().numpy()
+        #     grad_nldas_tmp = grad_nldas.detach().cpu().numpy()
+        #     grad_maurer_tmp = grad_maurer.detach().cpu().numpy()
+        #     grad_ar_daymet= np.concatenate([grad_ar_daymet, grad_daymet_tmp], axis=1)
+        #     grad_ar_maurer= np.concatenate([grad_ar_maurer, grad_maurer_tmp], axis=1)
+        #     grad_ar_nldas= np.concatenate([grad_ar_nldas, grad_nldas_tmp], axis=1)
+
+
+
+
+        yOut = yP.detach().cpu().numpy().swapaxes(0, 1)
+        if doMC is not False:
+            yOutMC = ySS.swapaxes(0, 1)
+
+        # save output
+        for k in range(ny):
+            f = fLst[k]
+            pd.DataFrame(yOut[:, :, k]).to_csv(f, header=False, index=False)
+        if doMC is not False:
+            for k in range(ny):
+                f = fLst[ny+k]
+                pd.DataFrame(yOutMC[:, :, k]).to_csv(
+                    f, header=False, index=False)
+        if i == 0:
+            prcp_pet_wghts_ar = prcp_pet_wghts.detach().cpu().numpy()
+        else:
+            prcp_pet_wghts_tmp = prcp_pet_wghts.detach().cpu().numpy()
+            prcp_pet_wghts_ar = np.concatenate([prcp_pet_wghts_ar, prcp_pet_wghts_tmp], axis=1)
+
+
+
+        model.zero_grad()
+        torch.cuda.empty_cache()
+
+    # for i in range(z1.shape[2]):
+        # k=1
+        # np.savetxt(filePathLst[0][:-43] + f'/{i}_grad_daymet.csv', grad_ar_daymet[:,:,i], delimiter=',')
+        # np.savetxt(filePathLst[0][:-43] + f'/{i}_grad_maurer.csv', grad_ar_maurer[:,:,i], delimiter=',')
+        # np.savetxt(filePathLst[0][:-43] + f'/{i}_grad_nldas.csv', grad_ar_nldas[:,:,i], delimiter=',')
+
+    for types in range(prcp_pet_wghts_ar.shape[2]):
+        np.savetxt(filePathLst[0][:-43] + f'/prcp_wghts{types + 1}.csv', prcp_pet_wghts_ar[:, :, types], delimiter=',')
+
+    for f in fLst:
+        f.close()
+
+    if batchSize == ngrid:
+        # For Wenping's work to calculate loss of testing data
+        # Only valid for testing without using minibatches
+        yOut = torch.from_numpy(yOut)
+        if type(model) in [rnn.CudnnLstmModel_R2P]:
+            Parameters_R2P = torch.from_numpy(Parameters_R2P)
+            if outModel is None:
+                return yOut, Parameters_R2P
+            else:
+                return q, evap, Parameters_R2P
+        else:
+            return yOut
 
 
 def randomSubset(x, y, dimSubset):

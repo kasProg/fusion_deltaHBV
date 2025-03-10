@@ -9,6 +9,69 @@ import csv
 import numpy as np
 import random
 
+class RangeBoundLoss(nn.Module):
+    """limit parameters from going out of range"""
+    def __init__(self, lb, ub):
+        super(RangeBoundLoss, self).__init__()
+        self.lb = torch.tensor(lb).cuda()
+        self.ub = torch.tensor(ub).cuda()
+        # self.factor = torch.tensor(factor).cuda()
+
+    def forward(self, params, factor):
+        factor = torch.tensor(factor).cuda()
+        loss = 0
+        for i in range(len(params)):
+            lb = self.lb[i]
+            ub = self.ub[i]
+            upper_bound_loss = factor * torch.relu(params[i] - ub).mean()
+            lower_bound_loss = factor * torch.relu(lb - params[i]).mean()
+            loss = loss + upper_bound_loss + lower_bound_loss
+        return loss
+
+class varianceLossFunction(nn.Module):
+    def __init__(self):
+        super(varianceLossFunction, self).__init__()
+    def forward(self, params, factor):
+        factor = torch.tensor(factor).cuda()
+        variance = torch.std(params, dim=2)
+        loss = (factor * variance).mean()
+        return loss
+
+class SmoothLossFunction(nn.Module):
+    """smooths the time series out"""
+    def __init__(self):
+        super(SmoothLossFunction, self).__init__()
+
+    def forward(self, params, factor):
+        factor = torch.tensor(factor).cuda()
+        loss = 0
+        num_params = params.shape
+        for i in range(num_params[2]):
+            param = params[:,:,i]
+            diff = torch.abs(param[1:, :] - param[:-1, :])
+            loss_diff = (factor * torch.sum(diff, dim=0)).mean()
+            loss = loss + loss_diff
+        return loss
+    
+class SimpAnn1(nn.Module):
+    def __init__(self, *, nx, ny, hiddenSize1, hiddenSize2, hiddenSize3, dr=0.5):
+        super(SimpAnn1, self).__init__()
+        self.i2h = nn.Linear(nx, hiddenSize1)
+        self.h2h1 = nn.Linear(hiddenSize1, hiddenSize2)
+        self.h2h2 = nn.Linear(hiddenSize2, hiddenSize3)
+        self.h2o = nn.Linear(hiddenSize3, ny)
+        self.dropout = nn.Dropout(dr)
+        self.ny = ny
+
+    def forward(self, x):
+        ht = F.relu(self.i2h(x))
+        ht = self.dropout(ht)  # Apply dropout after first hidden layer
+        ht1 = F.relu(self.h2h1(ht))
+        ht1 = self.dropout(ht1)  # Apply dropout after second hidden layer
+        ht2 = F.relu(self.h2h2(ht1))
+        ht2 = self.dropout(ht2)  # Apply dropout after third hidden layer
+        out = self.h2o(ht2)  # No dropout in the output layer
+        return out
 
 class LSTMcell_untied(torch.nn.Module):
     def __init__(self,
@@ -1848,3 +1911,160 @@ class MultiInv_HBVTDModel(torch.nn.Module):
         out = self.HBV(x, parameters=hbvpara, staind=self.staind, tdlst=self.tdlst, mu=self.nmul, muwts=wts, rtwts=routpara,
                           bufftime=self.inittime, routOpt=self.routOpt, comprout=self.comprout, dydrop=self.dydrop)
         return out
+
+class prcp_weights(torch.nn.Module):
+    def __init__(self, *, ninv, hiddeninv, drinv=0.5, prcp_datatypes=1):
+        super(prcp_weights, self).__init__()
+        self.ninv = ninv
+        self.prcp_datatypes = prcp_datatypes
+
+        ntp = prcp_datatypes
+        self.hiddeninv = hiddeninv
+
+        self.lstminv = CudnnLstmModel(
+            nx=ninv, ny=ntp, hiddenSize=hiddeninv, dr=drinv)
+        self.annrout = SimpAnn1(
+            nx=35, ny=2, hiddenSize1=128, hiddenSize2=64, hiddenSize3=32, dr=drinv)
+        # self.lstmrout = CudnnLstmModel(
+        #     nx=38, ny=2, hiddenSize=hiddeninv, dr=drinv)
+
+        lb_prcp = [0.95]
+        ub_prcp = [1.05]
+        self.RangeBoundLoss = RangeBoundLoss(lb=lb_prcp, ub=ub_prcp)
+        self.varianceLoss = varianceLossFunction()
+        self.SmoothLoss = SmoothLossFunction()
+
+
+    def forward(self, x, z, z_hbv, prcp_loss_factor, smooth_loss_factor):
+        # z.requires_grad =True
+
+        wghts = self.lstminv(z)
+        hbvrout = self.annrout(z_hbv)
+        # hbvrout = hbvrout[-1]
+        ntstep = wghts.shape[0]
+        ngage = wghts.shape[1]
+        wghts_scaled = torch.sigmoid(wghts)
+
+        #scaling
+        # wghts_scaled = 0.8 + wghts_scaled* (1.2 - 0.8)
+
+        prcp_wavg = torch.zeros((ntstep, ngage), requires_grad=True, dtype=torch.float32).cuda()
+        # prcp_wghts_sum = torch.sum(wghts_scaled, dim=2)
+
+
+        # temp_wavg = torch.zeros((ntstep, ngage), requires_grad=True, dtype=torch.float32).cuda()
+        # pet_wavg = torch.zeros((ntstep, ngage), requires_grad=True, dtype=torch.float32).cuda()
+        prcp_wghts_sum = torch.sum(wghts_scaled, dim=2)
+        # temp_wghts_sum = torch.sum(wghts_scaled[:,:,3:6], dim=2)
+        # pet_wghts_sum = torch.sum(wghts_scaled[:,:,6:], dim=2)
+
+
+
+        for para in range(wghts.shape[2]):
+            # if para<3:
+            prcp_wavg = prcp_wavg + wghts_scaled[:, :, para] * x[:, :, para]
+            # elif para<6:
+            #     temp_wavg = temp_wavg + wghts_scaled[:, :, para] * x[:, :, para]
+            # elif para>=6:
+            #     pet_wavg = pet_wavg + wghts_scaled[:, :, para] * x[:, :, para]
+
+        x_new = torch.empty((ntstep, ngage, 3), requires_grad=True, dtype=torch.float32).cuda()
+
+        # constraint to remove drizzle
+        # conditions = torch.sum(x[:,:,:3] == 0, dim=2) >= 2
+        # prcp_wavg[conditions] = 0
+
+        x_new[:, :, 0] = prcp_wavg
+        x_new[:, :, 1] = x[:, :, self.prcp_datatypes]
+        x_new[:, :, 2] = x[:, :, -1]
+        # x_new[:, :, 1] = temp_wavg
+        # x_new[:, :, 2] = pet_wavg
+        # range_bound_loss_prcp = self.RangeBoundLoss([prcp_wghts_sum], factor=prcp_loss_factor)+self.RangeBoundLoss([temp_wghts_sum], factor=prcp_loss_factor)+self.RangeBoundLoss([pet_wghts_sum], factor=prcp_loss_factor)
+        range_bound_loss_prcp = self.RangeBoundLoss([prcp_wghts_sum], factor=prcp_loss_factor)
+        # smooth_loss = self.SmoothLoss(wghts_scaled, factor=smooth_loss_factor)
+        # variance_loss = self.varianceLoss(wghts_scaled, factor=smooth_loss_factor)
+        variance_loss = torch.tensor(0).cuda()
+
+        # range_bound_loss_prcp = 0
+
+        # grad_daymet = autograd.grad(outputs=wghts_scaled[:, :, 0], inputs=z, grad_outputs=torch.ones_like(wghts_scaled[:, :, 0]), retain_graph=True)[0]
+        # grad_maurer = autograd.grad(outputs=wghts_scaled[:, :, 1], inputs=z, grad_outputs=torch.ones_like(wghts_scaled[:, :, 1]), retain_graph=True)[0]
+        # grad_nldas = autograd.grad(outputs=wghts_scaled[:, :, 2], inputs=z, grad_outputs=torch.ones_like(wghts_scaled[:, :, 2]), retain_graph=True)[0]
+
+        # return x_new, range_bound_loss_prcp, variance_loss, wghts_scaled, hbvrout, grad_daymet, grad_maurer, grad_nldas
+        return x_new, range_bound_loss_prcp, variance_loss, wghts_scaled, hbvrout
+
+ 
+
+class forc_weights(torch.nn.Module):
+    def __init__(self, *, ninv, hiddeninv, drinv=0.5, prcp_datatypes=1):
+        super(forc_weights, self).__init__()
+        self.ninv = ninv
+        self.prcp_datatypes = prcp_datatypes
+
+        ntp = prcp_datatypes*3
+        self.hiddeninv = hiddeninv
+
+        self.lstminv = CudnnLstmModel(
+            nx=ninv, ny=ntp, hiddenSize=hiddeninv, dr=drinv)
+        self.annrout = SimpAnn1(
+            nx=35, ny=2, hiddenSize1=128, hiddenSize2=64, hiddenSize3=32, dr=drinv)
+        # self.lstmrout = CudnnLstmModel(
+        #     nx=38, ny=2, hiddenSize=hiddeninv, dr=drinv)
+
+        lb_prcp = [0.95]
+        ub_prcp = [1.05]
+        self.RangeBoundLoss = RangeBoundLoss(lb=lb_prcp, ub=ub_prcp)
+        self.varianceLoss = varianceLossFunction()
+        self.SmoothLoss = SmoothLossFunction()
+
+
+    def forward(self, x, z, z_hbv, prcp_loss_factor, smooth_loss_factor):
+        # z.requires_grad = True
+
+        wghts = self.lstminv(z)
+        hbvrout = self.annrout(z_hbv)
+        ntstep = wghts.shape[0]
+        ngage = wghts.shape[1]
+        wghts_scaled = torch.sigmoid(wghts)
+        prcp_wavg = torch.zeros((ntstep, ngage), requires_grad=True, dtype=torch.float32).cuda()
+        temp_wavg = torch.zeros((ntstep, ngage), requires_grad=True, dtype=torch.float32).cuda()
+        pet_wavg = torch.zeros((ntstep, ngage), requires_grad=True, dtype=torch.float32).cuda()
+        prcp_wghts_sum = torch.sum(wghts_scaled[:,:,:3], dim=2)
+        temp_wghts_sum = torch.sum(wghts_scaled[:,:,3:6], dim=2)
+        pet_wghts_sum = torch.sum(wghts_scaled[:,:,6:], dim=2)
+
+
+
+        for para in range(wghts.shape[2]):
+            if para<3:
+                prcp_wavg = prcp_wavg + wghts_scaled[:, :, para] * x[:, :, para]
+            elif para<6:
+                temp_wavg = temp_wavg + wghts_scaled[:, :, para] * x[:, :, para]
+            elif para>=6:
+                pet_wavg = pet_wavg + wghts_scaled[:, :, para] * x[:, :, para]
+
+        x_new = torch.empty((ntstep, ngage, 3), requires_grad=True, dtype=torch.float32).cuda()
+
+        #constraint to remove drizzle
+        # conditions = torch.sum(x[:,:,:3] == 0, dim=2) >= 2
+        # prcp_wavg[conditions] = 0
+
+        x_new[:, :, 0] = prcp_wavg
+        x_new[:, :, 1] = temp_wavg
+        x_new[:, :, 2] = pet_wavg
+        range_bound_loss_prcp = self.RangeBoundLoss([prcp_wghts_sum], factor=prcp_loss_factor)+self.RangeBoundLoss([temp_wghts_sum], factor=prcp_loss_factor)+self.RangeBoundLoss([pet_wghts_sum], factor=prcp_loss_factor)
+        # smooth_loss = self.SmoothLoss(wghts_scaled, factor=smooth_loss_factor)
+        variance_loss = self.varianceLoss(wghts_scaled, factor=smooth_loss_factor)
+        # variance_loss = torch.tensor(0)
+
+        # range_bound_loss_prcp = 0
+
+        # grad_daymet = autograd.grad(outputs=wghts_scaled[:, :, 0], inputs=z, grad_outputs=torch.ones_like(wghts_scaled[:, :, 0]), retain_graph=True)[0]
+        # grad_maurer = autograd.grad(outputs=wghts_scaled[:, :, 1], inputs=z, grad_outputs=torch.ones_like(wghts_scaled[:, :, 1]), retain_graph=True)[0]
+        # grad_nldas = autograd.grad(outputs=wghts_scaled[:, :, 2], inputs=z, grad_outputs=torch.ones_like(wghts_scaled[:, :, 2]), retain_graph=True)[0]
+
+        # return x_new, range_bound_loss_prcp, smooth_loss, wghts_scaled, grad_daymet, grad_maurer, grad_nldas
+        return x_new, range_bound_loss_prcp, variance_loss, wghts_scaled, hbvrout
+
+
